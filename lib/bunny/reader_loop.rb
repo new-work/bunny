@@ -32,7 +32,6 @@ module Bunny
         break if @mutex.synchronize { @stopping || @stopped || @network_is_down }
 
         run_once
-        raise IOError.new('TRIGGER ERROR') if rand <= 0.1
       rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError, Timeout::Error,
              OpenSSL::OpenSSLError => e
         break if terminate? || @session.closing? || @session.closed?
