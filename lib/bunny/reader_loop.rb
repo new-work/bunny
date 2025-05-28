@@ -1,5 +1,3 @@
-require "thread"
-
 module Bunny
   # Network activity loop that reads and passes incoming AMQP 0.9.1 methods for
   # processing. They are dispatched further down the line in Bunny::Session and Bunny::Channel.
@@ -8,7 +6,6 @@ module Bunny
   # This mimics the way RabbitMQ Java is designed quite closely.
   # @private
   class ReaderLoop
-
     def initialize(transport, session, session_error_handler)
       @transport             = transport
       @session               = session
@@ -22,49 +19,51 @@ module Bunny
       @network_is_down       = false
     end
 
-
     def start
-      @thread    = Thread.new(&method(:run_loop))
+      @thread = Thread.new(&method(:run_loop))
     end
 
     def resume
       start
     end
 
-
     def run_loop
       loop do
-        begin
-          break if @mutex.synchronize { @stopping || @stopped || @network_is_down }
-          run_once
-        rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError, Timeout::Error,
-               OpenSSL::OpenSSLError => e
-          break if terminate? || @session.closing? || @session.closed?
+        break if @mutex.synchronize { @stopping || @stopped || @network_is_down }
+
+        run_once
+        raise IOError.new('TRIGGER ERROR') if rand <= 0.1
+      rescue AMQ::Protocol::EmptyResponseError, IOError, SystemCallError, Timeout::Error,
+             OpenSSL::OpenSSLError => e
+        break if terminate? || @session.closing? || @session.closed?
+
+        @network_is_down = true
+        if @session.automatically_recover?
+          log_exception(e, level: :warn)
+          @session.handle_network_failure(e)
+        else
+          log_exception(e)
+          @session_error_handler.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
+        end
+      rescue ShutdownSignal => _e
+        @mutex.synchronize { @stopping = true }
+        break
+      rescue Exception => e
+        break if terminate?
+
+        unless @session.closing? || @session.closed?
+          log_exception(e)
 
           @network_is_down = true
-          if @session.automatically_recover?
-            log_exception(e, level: :warn)
-            @session.handle_network_failure(e)
-          else
-            log_exception(e)
-            @session_error_handler.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
-          end
-        rescue ShutdownSignal => _
-          @mutex.synchronize { @stopping = true }
-          break
-        rescue Exception => e
-          break if terminate?
-          if !(@session.closing? || @session.closed?)
-            log_exception(e)
-
-            @network_is_down = true
-            @session_error_handler.raise(Bunny::NetworkFailure.new("caught an unexpected exception in the network loop: #{e.message}", e))
-          end
-        rescue Errno::EBADF => _ebadf
-          break if terminate?
-          # ignored, happens when we loop after the transport has already been closed
-          @mutex.synchronize { @stopping = true }
+          @session_error_handler.raise(Bunny::NetworkFailure.new(
+                                         "caught an unexpected exception in the network loop: #{e.message}", e
+                                       ))
         end
+      rescue Errno::EBADF => _e
+        break if terminate?
+
+        # ignored, happens when we loop after the transport has already been closed
+        @mutex.synchronize { @stopping = true }
       end
 
       @mutex.synchronize { @stopped = true }
@@ -127,21 +126,21 @@ module Bunny
     end
 
     def kill
-      if @thread
-        @thread.kill
-        @thread.join
-      end
+      return unless @thread
+
+      @thread.kill
+      @thread.join
     end
 
     protected
 
     def log_exception(e, level: :error)
-      if !(io_error?(e) && (@session.closing? || @session.closed?))
-        @logger.send level, "Exception in the reader loop: #{e.class.name}: #{e.message}"
-        @logger.send level, "Backtrace: "
-        e.backtrace.each do |line|
-          @logger.send level, "\t#{line}"
-        end
+      return if io_error?(e) && (@session.closing? || @session.closed?)
+
+      @logger.send level, "Exception in the reader loop: #{e.class.name}: #{e.message}"
+      @logger.send level, 'Backtrace: '
+      e.backtrace.each do |line|
+        @logger.send level, "\t#{line}"
       end
     end
 
